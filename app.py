@@ -1,17 +1,30 @@
+from datetime import datetime, timedelta
+
 import streamlit as st
 import yfinance as yf
 import plotly.express as px
 import pandas as pd
 import numpy as np
+from curl_cffi import requests as curl_requests
 
-from db import init_db, upsert_ohlcv, load_ohlcv, has_data, log_request, get_request_counts
+from db import (
+    init_db, upsert_ohlcv, load_ohlcv, has_data,
+    log_request, get_request_counts, get_last_date,
+)
+
+
+@st.cache_resource
+def get_yf_session():
+    # Chrome TLS/HTTP fingerprint — Yahoo's free endpoints throttle the
+    # default python-requests fingerprint aggressively.
+    return curl_requests.Session(impersonate="chrome")
 
 st.set_page_config(page_title="Stock Daily Range", layout="wide")
 
 DEFAULT_TICKERS = [
     "TSLA", "GOOGL", "META", "AAPL", "AMZN",
     "AVGO", "ORCL", "NVDA", "MSFT", "QQQ",
-    "SLV", "GLD", "IBIT",
+    "SPY", "SLV", "GLD", "IBIT",
 ]
 
 
@@ -20,30 +33,55 @@ def get_connection():
     return init_db()
 
 
+def _fallback_with_warning(conn, ticker: str, reason: str) -> pd.DataFrame:
+    """Return cached data (if any) and surface a warning instead of an error."""
+    cached = load_ohlcv(conn, ticker)
+    ok, total = get_request_counts(conn)
+    if not cached.empty:
+        last = str(cached.index[-1].date())
+        st.warning(
+            f"Could not refresh **{ticker}** ({reason}). "
+            f"Showing cached data through **{last}**.\n\n"
+            f"YF requests: {ok} OK / {total} total"
+        )
+    else:
+        st.error(
+            f"Could not fetch data for '{ticker}' ({reason}) and no cached data is available.\n\n"
+            f"YF requests: {ok} OK / {total} total"
+        )
+    return cached
+
+
 def fetch_and_store(conn, ticker: str) -> pd.DataFrame:
+    # Incremental pull: start one day before last stored date (re-fetches that
+    # bar in case it was partial, appends anything newer). Full 1y on first use.
+    last_date = get_last_date(conn, ticker)
+    if last_date:
+        start = (datetime.fromisoformat(last_date) - timedelta(days=1)).date()
+        kwargs: dict = {"start": start.isoformat()}
+    else:
+        kwargs = {"period": "1y"}
+
     try:
-        t = yf.Ticker(ticker)
-        raw = t.history(period="1y")
+        raw = yf.Ticker(ticker, session=get_yf_session()).history(**kwargs)
     except Exception as e:
         log_request(conn, ticker, success=False)
-        ok, total = get_request_counts(conn)
-        st.error(
-            f"Failed to fetch {ticker}: {e}\n\n"
-            f"Successful requests: **{ok}** / {total} total"
-        )
-        return load_ohlcv(conn, ticker)  # fall back to cached data
+        return _fallback_with_warning(conn, ticker, f"fetch error: {e}")
+
     if raw.empty:
         log_request(conn, ticker, success=False)
-        ok, total = get_request_counts(conn)
-        st.error(
-            f"Could not fetch data for '{ticker}'. "
-            "You may be rate-limited — wait a minute and try again.\n\n"
-            f"Successful requests: **{ok}** / {total} total"
+        # Empty incremental pull is normal on weekends/holidays/pre-open —
+        # just return cached data silently if it exists.
+        if last_date:
+            cached = load_ohlcv(conn, ticker)
+            if not cached.empty:
+                return cached
+        return _fallback_with_warning(
+            conn, ticker,
+            "no data returned — possibly rate-limited, wait a minute",
         )
-        return pd.DataFrame()
+
     log_request(conn, ticker, success=True)
-    # Ticker.history() returns columns: Open, High, Low, Close, Volume, Dividends, Stock Splits
-    # Keep only what we need
     raw = raw[["Open", "High", "Low", "Close", "Volume"]]
     upsert_ohlcv(conn, ticker, raw)
     return load_ohlcv(conn, ticker)
@@ -135,6 +173,8 @@ st.sidebar.caption(f"YF requests: {_ok} OK / {_total} total")
 if refresh or not has_data(conn, ticker):
     with st.spinner(f"Fetching {ticker} from Yahoo Finance..."):
         df = fetch_and_store(conn, ticker)
+    # fetch_and_store already surfaces warnings/errors and falls back to
+    # cached data when possible. Only stop if we truly have nothing to plot.
     if df.empty:
         st.stop()
 else:

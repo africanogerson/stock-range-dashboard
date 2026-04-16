@@ -77,6 +77,15 @@ def has_data(conn: sqlite3.Connection, ticker: str) -> bool:
     return cur.fetchone() is not None
 
 
+def get_last_date(conn: sqlite3.Connection, ticker: str) -> str | None:
+    """Return the most recent stored date (YYYY-MM-DD) for ticker, or None."""
+    cur = conn.execute(
+        "SELECT MAX(date) FROM ohlcv WHERE ticker = ?", (ticker,)
+    )
+    row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
 def log_request(conn: sqlite3.Connection, ticker: str, success: bool) -> None:
     conn.execute(
         "INSERT INTO request_log (ticker, success) VALUES (?, ?)",

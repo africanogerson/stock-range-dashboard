@@ -1,25 +1,39 @@
-"""Quick diagnostic script to test yfinance connectivity."""
+"""Quick diagnostic: plain yfinance vs curl_cffi browser-impersonated session."""
 
-import yfinance as yf
 import time
+import yfinance as yf
+from curl_cffi import requests as curl_requests
 
 TICKERS = ["SPY", "AAPL", "GLD"]
 
-print("=== yfinance connectivity test ===\n")
 
-for ticker in TICKERS:
-    print(f"Fetching {ticker}...", end=" ")
-    try:
-        data = yf.download(ticker, period="5d", auto_adjust=True, progress=False)
-        if data.empty:
-            print("EMPTY (possible rate limit)")
-        else:
-            print(f"OK — {len(data)} rows")
-            print(f"  Columns: {list(data.columns)}")
-            print(f"  MultiIndex: {isinstance(data.columns, __import__('pandas').MultiIndex)}")
-            print(f"  Head:\n{data.head()}")
-    except Exception as e:
-        print(f"ERROR: {type(e).__name__}: {e}")
-    time.sleep(2)  # small delay between requests
+def test_plain():
+    print("--- Plain yfinance (default session) ---")
+    for ticker in TICKERS:
+        print(f"  {ticker}...", end=" ", flush=True)
+        try:
+            data = yf.Ticker(ticker).history(period="5d")
+            print("EMPTY" if data.empty else f"OK ({len(data)} rows)")
+        except Exception as e:
+            print(f"ERROR: {type(e).__name__}: {e}")
+        time.sleep(2)
 
-print("\nDone.")
+
+def test_curl_cffi():
+    print("\n--- curl_cffi (impersonate=chrome) ---")
+    session = curl_requests.Session(impersonate="chrome")
+    for ticker in TICKERS:
+        print(f"  {ticker}...", end=" ", flush=True)
+        try:
+            data = yf.Ticker(ticker, session=session).history(period="5d")
+            print("EMPTY" if data.empty else f"OK ({len(data)} rows)")
+        except Exception as e:
+            print(f"ERROR: {type(e).__name__}: {e}")
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    print("=== yfinance connectivity test ===\n")
+    test_plain()
+    test_curl_cffi()
+    print("\nDone.")
