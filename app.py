@@ -87,6 +87,40 @@ def fetch_and_store(conn, ticker: str) -> pd.DataFrame:
     return load_ohlcv(conn, ticker)
 
 
+def compute_range(df: pd.DataFrame, pct_mode: bool) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype=float)
+    if pct_mode:
+        rng = (df["High"] - df["Low"]) / df["Close"].shift(1) * 100
+    else:
+        rng = df["High"] - df["Low"]
+    return rng.dropna()
+
+
+def build_median_table(conn, tickers, pct_mode: bool, custom_n: int) -> pd.DataFrame:
+    custom_n = int(custom_n)
+    custom_col = f"{custom_n}-Day"
+    rows = []
+    for t in tickers:
+        data = load_ohlcv(conn, t)
+        rng = compute_range(data, pct_mode)
+        if rng.empty:
+            rows.append({
+                "Ticker": t, "Today": None, "14-Day": None, "28-Day": None,
+                custom_col: None, "Last": "N/A",
+            })
+            continue
+        rows.append({
+            "Ticker": t,
+            "Today": rng.iloc[-1],
+            "14-Day": rng.tail(14).median(),
+            "28-Day": rng.tail(28).median(),
+            custom_col: rng.tail(custom_n).median(),
+            "Last": str(data.index[-1].date()),
+        })
+    return pd.DataFrame(rows)
+
+
 def make_histogram(series: pd.Series, title: str, unit: str, last_date: str, bin_width: float = 0.0):
     if series.empty:
         return None
@@ -170,11 +204,21 @@ st.sidebar.caption(f"YF requests: {_ok} OK / {_total} total")
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
-if refresh or not has_data(conn, ticker):
+if refresh:
+    progress = st.progress(0.0, text="Refreshing default tickers...")
+    to_fetch = list(DEFAULT_TICKERS)
+    if ticker not in to_fetch:
+        to_fetch.append(ticker)
+    for i, t in enumerate(to_fetch, start=1):
+        progress.progress(i / len(to_fetch), text=f"Fetching {t} ({i}/{len(to_fetch)})...")
+        fetch_and_store(conn, t)
+    progress.empty()
+    df = load_ohlcv(conn, ticker)
+    if df.empty:
+        st.stop()
+elif not has_data(conn, ticker):
     with st.spinner(f"Fetching {ticker} from Yahoo Finance..."):
         df = fetch_and_store(conn, ticker)
-    # fetch_and_store already surfaces warnings/errors and falls back to
-    # cached data when possible. Only stop if we truly have nothing to plot.
     if df.empty:
         st.stop()
 else:
@@ -239,3 +283,17 @@ if not custom_sliced.empty:
         showlegend=False,
     )
     st.plotly_chart(ts_fig, use_container_width=True)
+
+# ── Median summary table (default tickers) ──────────────────────────────────
+st.markdown("---")
+st.subheader(f"Median Daily Range — Default Tickers ({unit})")
+median_df = build_median_table(conn, DEFAULT_TICKERS, pct_mode, int(custom_n))
+fmt = f"{{:.2f}}{unit}"
+numeric_cols = [c for c in median_df.columns if c not in ("Ticker", "Last")]
+table_col, _ = st.columns(2)
+with table_col:
+    st.dataframe(
+        median_df.style.format({c: fmt for c in numeric_cols}, na_rep="—"),
+        hide_index=True,
+        use_container_width=True,
+    )
