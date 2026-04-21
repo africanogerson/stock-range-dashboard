@@ -387,8 +387,8 @@ custom = st.sidebar.text_input("Or enter a custom ticker").strip().upper()
 ticker = custom if custom else selected
 
 pct_mode = st.sidebar.toggle("Show as percentage (%)", value=False)
-custom_n = st.sidebar.number_input("Custom window (days)", min_value=2, max_value=365, value=7)
-default_bw = 1.0 if pct_mode else 2.0
+custom_n = st.sidebar.number_input("Custom window (days)", min_value=2, max_value=365, value=40)
+default_bw = 1.0 if pct_mode else 1.0
 custom_bin_width = st.sidebar.number_input("Bin width (0 = auto)", min_value=0.0, value=default_bw, step=0.1, format="%.2f")
 intraday_lookback = st.sidebar.slider("Intraday lookback (days)", 5, 120, 40)
 halfhour_hours = st.sidebar.slider("30-min boxplot: first N hours", 1, 6, 3)
