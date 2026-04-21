@@ -121,6 +121,183 @@ def build_median_table(conn, tickers, pct_mode: bool, custom_n: int) -> pd.DataF
     return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_intraday_hourly(ticker: str, lookback_days: int) -> pd.DataFrame:
+    """Fetch 1h OHLCV and tag each bar with its ordinal position in the session."""
+    period = f"{lookback_days + 14}d"
+    try:
+        raw = yf.Ticker(ticker, session=get_yf_session()).history(
+            period=period, interval="60m", prepost=False, auto_adjust=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+
+    raw = raw[["Open", "High", "Low", "Close"]].copy()
+    raw["session_date"] = raw.index.tz_convert("America/New_York").date
+    raw["session_hour"] = raw.groupby("session_date").cumcount() + 1
+    keep_dates = sorted(raw["session_date"].unique())[-lookback_days:]
+    return raw[raw["session_date"].isin(keep_dates)]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_intraday_30m(ticker: str, lookback_days: int) -> pd.DataFrame:
+    """Fetch 30m OHLCV and tag each bar with its ordinal position in the session."""
+    # yfinance caps 30m data to ~60 days; clamp to stay within the limit.
+    capped = min(lookback_days, 55)
+    period = f"{capped + 14}d"
+    try:
+        raw = yf.Ticker(ticker, session=get_yf_session()).history(
+            period=period, interval="30m", prepost=False, auto_adjust=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+
+    raw = raw[["Open", "High", "Low", "Close"]].copy()
+    raw["session_date"] = raw.index.tz_convert("America/New_York").date
+    raw["session_half"] = raw.groupby("session_date").cumcount() + 1
+    keep_dates = sorted(raw["session_date"].unique())[-capped:]
+    return raw[raw["session_date"].isin(keep_dates)]
+
+
+def build_hourly_boxplot_frame(df: pd.DataFrame, pct_mode: bool) -> pd.DataFrame:
+    """Return long DataFrame [session_hour, range, group] with three groups:
+    'All days', '≥ median days', and '< median days' — split by the static
+    median daily range of the lookback window."""
+    if df.empty:
+        return df
+    bars = df.copy()
+    if pct_mode:
+        bars["range"] = (bars["High"] - bars["Low"]) / bars["Close"].shift(1) * 100
+    else:
+        bars["range"] = bars["High"] - bars["Low"]
+    bars = bars.dropna(subset=["range"])
+    if bars.empty:
+        return bars
+
+    daily = bars.groupby("session_date").agg(
+        day_high=("High", "max"),
+        day_low=("Low", "min"),
+        day_first_close=("Close", "first"),
+    )
+    if pct_mode:
+        # Approximates prior close with the day's first 1h Close — the intraday
+        # frame has no daily-granularity prior close. Only affects ranking.
+        daily["day_range"] = (daily["day_high"] - daily["day_low"]) / daily["day_first_close"] * 100
+    else:
+        daily["day_range"] = daily["day_high"] - daily["day_low"]
+
+    median_cut = daily["day_range"].median()
+    above_dates = set(daily.index[daily["day_range"] >= median_cut])
+    below_dates = set(daily.index[daily["day_range"] < median_cut])
+
+    all_rows = bars[["session_hour", "range"]].assign(group="All days")
+    above_rows = (
+        bars[bars["session_date"].isin(above_dates)][["session_hour", "range"]]
+        .assign(group="≥ median days")
+    )
+    below_rows = (
+        bars[bars["session_date"].isin(below_dates)][["session_hour", "range"]]
+        .assign(group="< median days")
+    )
+    return pd.concat([all_rows, above_rows, below_rows], ignore_index=True)
+
+
+def build_halfhour_boxplot_frame(df: pd.DataFrame, pct_mode: bool, max_halves: int) -> pd.DataFrame:
+    """Like build_hourly_boxplot_frame, but on 30-min bars and truncated to the
+    first `max_halves` half-hour slots of each session. The daily-range median
+    cutoff is computed across the full session (not just the first N slots)."""
+    if df.empty:
+        return df
+    bars = df.copy()
+    if pct_mode:
+        bars["range"] = (bars["High"] - bars["Low"]) / bars["Close"].shift(1) * 100
+    else:
+        bars["range"] = bars["High"] - bars["Low"]
+    bars = bars.dropna(subset=["range"])
+    if bars.empty:
+        return bars
+
+    daily = bars.groupby("session_date").agg(
+        day_high=("High", "max"),
+        day_low=("Low", "min"),
+        day_first_close=("Close", "first"),
+    )
+    if pct_mode:
+        daily["day_range"] = (daily["day_high"] - daily["day_low"]) / daily["day_first_close"] * 100
+    else:
+        daily["day_range"] = daily["day_high"] - daily["day_low"]
+
+    median_cut = daily["day_range"].median()
+    above_dates = set(daily.index[daily["day_range"] >= median_cut])
+    below_dates = set(daily.index[daily["day_range"] < median_cut])
+
+    bars = bars[bars["session_half"] <= max_halves]
+
+    all_rows = bars[["session_half", "range"]].assign(group="All days")
+    above_rows = (
+        bars[bars["session_date"].isin(above_dates)][["session_half", "range"]]
+        .assign(group="≥ median days")
+    )
+    below_rows = (
+        bars[bars["session_date"].isin(below_dates)][["session_half", "range"]]
+        .assign(group="< median days")
+    )
+    return pd.concat([all_rows, above_rows, below_rows], ignore_index=True)
+
+
+def make_hourly_boxplot(long_df: pd.DataFrame, ticker: str, unit: str, lookback_days: int):
+    if long_df.empty:
+        return None
+    label = "Range ($)" if unit == "$" else "Range (%)"
+    fig = px.box(
+        long_df,
+        x="session_hour",
+        y="range",
+        color="group",
+        points="outliers",
+        boxmode="group",
+        title=f"Intraday Range by Session Hour — {ticker} (last {lookback_days} trading days)",
+        labels={
+            "session_hour": "Trading hour (1 = 09:30–10:30 ET)",
+            "range": label,
+            "group": "",
+        },
+        category_orders={"group": ["All days", "≥ median days", "< median days"]},
+    )
+    fig.update_layout(height=440, legend=dict(orientation="h", y=-0.15))
+    fig.update_xaxes(dtick=1)
+    return fig
+
+
+def make_halfhour_boxplot(long_df: pd.DataFrame, ticker: str, unit: str, lookback_days: int, max_halves: int):
+    if long_df.empty:
+        return None
+    label = "Range ($)" if unit == "$" else "Range (%)"
+    hours = max_halves / 2
+    fig = px.box(
+        long_df,
+        x="session_half",
+        y="range",
+        color="group",
+        points="outliers",
+        boxmode="group",
+        title=f"Intraday Range by 30-min Slot — {ticker} (first {hours:g}h of session, last {lookback_days} trading days)",
+        labels={
+            "session_half": "30-min slot (1 = 09:30–10:00 ET)",
+            "range": label,
+            "group": "",
+        },
+        category_orders={"group": ["All days", "≥ median days", "< median days"]},
+    )
+    fig.update_layout(height=440, legend=dict(orientation="h", y=-0.15))
+    fig.update_xaxes(dtick=1)
+    return fig
+
+
 def make_histogram(series: pd.Series, title: str, unit: str, last_date: str, bin_width: float = 0.0):
     if series.empty:
         return None
@@ -140,14 +317,31 @@ def make_histogram(series: pd.Series, title: str, unit: str, last_date: str, bin
         nbins = max(5, len(series) // 2)
         display_bw = (bin_max - bin_min) / nbins if nbins > 0 else 0
     median_val = series.median()
-    fmt = f"{median_val:.2f}"
+    q25 = series.quantile(0.25)
+    q75 = series.quantile(0.75)
+    fig.add_vline(
+        x=q25,
+        line_dash="dot",
+        line_color="steelblue",
+        annotation_text=f"Q1: {q25:.2f}{unit}",
+        annotation_position="top left",
+        annotation_font_color="steelblue",
+    )
     fig.add_vline(
         x=median_val,
         line_dash="dash",
         line_color="red",
-        annotation_text=f"Median: {fmt}{unit}",
-        annotation_position="top right",
+        annotation_text=f"Median: {median_val:.2f}{unit}",
+        annotation_position="top",
         annotation_font_color="red",
+    )
+    fig.add_vline(
+        x=q75,
+        line_dash="dot",
+        line_color="steelblue",
+        annotation_text=f"Q3: {q75:.2f}{unit}",
+        annotation_position="top right",
+        annotation_font_color="steelblue",
     )
     # Show each data point as a rug plot on the x-axis
     fig.add_scatter(
@@ -196,6 +390,8 @@ pct_mode = st.sidebar.toggle("Show as percentage (%)", value=False)
 custom_n = st.sidebar.number_input("Custom window (days)", min_value=2, max_value=365, value=7)
 default_bw = 1.0 if pct_mode else 2.0
 custom_bin_width = st.sidebar.number_input("Bin width (0 = auto)", min_value=0.0, value=default_bw, step=0.1, format="%.2f")
+intraday_lookback = st.sidebar.slider("Intraday lookback (days)", 5, 120, 40)
+halfhour_hours = st.sidebar.slider("30-min boxplot: first N hours", 1, 6, 3)
 refresh = st.sidebar.button("Refresh Data")
 
 st.sidebar.markdown("---")
@@ -283,6 +479,28 @@ if not custom_sliced.empty:
         showlegend=False,
     )
     st.plotly_chart(ts_fig, use_container_width=True)
+
+# ── Intraday hourly boxplot ─────────────────────────────────────────────────
+st.markdown("---")
+intraday_df = fetch_intraday_hourly(ticker, int(intraday_lookback))
+long_df = build_hourly_boxplot_frame(intraday_df, pct_mode)
+box_fig = make_hourly_boxplot(long_df, ticker, unit, int(intraday_lookback))
+if box_fig is not None:
+    st.plotly_chart(box_fig, use_container_width=True)
+else:
+    st.info(f"No intraday data available for {ticker}.")
+
+# ── Intraday 30-min boxplot (first N hours) ─────────────────────────────────
+st.markdown("---")
+effective_30m_days = min(int(intraday_lookback), 55)
+max_halves = int(halfhour_hours) * 2
+df30 = fetch_intraday_30m(ticker, int(intraday_lookback))
+long_df30 = build_halfhour_boxplot_frame(df30, pct_mode, max_halves)
+box_fig_30 = make_halfhour_boxplot(long_df30, ticker, unit, effective_30m_days, max_halves)
+if box_fig_30 is not None:
+    st.plotly_chart(box_fig_30, use_container_width=True)
+else:
+    st.info(f"No 30-min intraday data available for {ticker}.")
 
 # ── Median summary table (default tickers) ──────────────────────────────────
 st.markdown("---")
