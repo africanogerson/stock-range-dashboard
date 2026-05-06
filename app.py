@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import streamlit as st
 import yfinance as yf
 import plotly.express as px
+import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 from curl_cffi import requests as curl_requests
@@ -95,6 +96,16 @@ def compute_range(df: pd.DataFrame, pct_mode: bool) -> pd.Series:
     else:
         rng = df["High"] - df["Low"]
     return rng.dropna()
+
+
+def compute_gap(df: pd.DataFrame, pct_mode: bool) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype=float)
+    prev_close = df["Close"].shift(1)
+    gap = df["Open"] - prev_close
+    if pct_mode:
+        gap = gap / prev_close * 100
+    return gap.dropna()
 
 
 def build_median_table(conn, tickers, pct_mode: bool, custom_n: int) -> pd.DataFrame:
@@ -453,32 +464,82 @@ for col, window, label in zip(cols, windows, labels):
 # ── Time series: Date vs Day Range (custom window) ──────────────────────────
 st.markdown("---")
 custom_sliced = df.tail(int(custom_n))
+if "show_gap_overlay" not in st.session_state:
+    st.session_state["show_gap_overlay"] = True
+show_gap_overlay = st.session_state["show_gap_overlay"]
 if not custom_sliced.empty:
     range_label = f"Range ({unit})"
     ts_fig = px.line(
         custom_sliced,
         x=custom_sliced.index,
         y="range",
-        title=f"Daily Range Over Last {int(custom_n)} Days — {ticker}",
+        title=(
+            f"Daily Range & Overnight Gap — Last {int(custom_n)} Days — {ticker}"
+            if show_gap_overlay
+            else f"Daily Range Over Last {int(custom_n)} Days — {ticker}"
+        ),
         labels={"x": "Date", "range": range_label},
         markers=True,
     )
-    ts_fig.update_traces(line_dash="dash")
+    ts_fig.update_traces(line_dash="dash", name="Day Range", showlegend=show_gap_overlay)
+    if show_gap_overlay:
+        gap_overlay = compute_gap(custom_sliced, pct_mode)
+        if not gap_overlay.empty:
+            ts_fig.add_trace(go.Scatter(
+                x=gap_overlay.index,
+                y=gap_overlay.values,
+                mode="markers",
+                name="Gap (Open − Prev Close)",
+                marker=dict(symbol="asterisk", size=6, line=dict(width=1)),
+            ))
+            ts_fig.add_hline(y=0, line_color="gray")
     median_val = custom_sliced["range"].median()
     ts_fig.add_hline(
         y=median_val,
         line_dash="dash",
         line_color="red",
-        annotation_text=f"Median: {median_val:.2f}{unit}",
+        annotation_text=f"Median range: {median_val:.2f}{unit}",
         annotation_position="top left",
     )
     ts_fig.update_layout(
-        height=400,
+        height=440,
         xaxis_title="Date",
-        yaxis_title=range_label,
-        showlegend=False,
+        yaxis_title=f"Value ({unit})" if show_gap_overlay else range_label,
+        legend=dict(orientation="h", y=-0.2),
+        showlegend=show_gap_overlay,
     )
     st.plotly_chart(ts_fig, use_container_width=True)
+    st.toggle("Overlay gaps on range chart", key="show_gap_overlay")
+
+# ── Time series: Overnight Gap (Open − Prev Close) ──────────────────────────
+st.markdown("---")
+gap_series = compute_gap(custom_sliced, pct_mode)
+if not gap_series.empty:
+    gap_label = f"Gap ({unit})"
+    gap_fig = px.line(
+        x=gap_series.index,
+        y=gap_series.values,
+        title=f"Overnight Gap (Open − Prev Close) — Last {int(custom_n)} Days — {ticker}",
+        labels={"x": "Date", "y": gap_label},
+        markers=True,
+    )
+    gap_fig.update_traces(line_dash="dash")
+    gap_fig.add_hline(y=0, line_color="gray")
+    median_gap = gap_series.median()
+    gap_fig.add_hline(
+        y=median_gap,
+        line_dash="dash",
+        line_color="red",
+        annotation_text=f"Median: {median_gap:.2f}{unit}",
+        annotation_position="top left",
+    )
+    gap_fig.update_layout(
+        height=400,
+        xaxis_title="Date",
+        yaxis_title=gap_label,
+        showlegend=False,
+    )
+    st.plotly_chart(gap_fig, use_container_width=True)
 
 # ── Intraday hourly boxplot ─────────────────────────────────────────────────
 st.markdown("---")
